@@ -1,0 +1,28 @@
+# Requirements for FP4 Quantization and Inference on RTX 5090 (Blackwell)
+# 
+# Install with:
+#   pip install -r requirements_fp4.txt --extra-index-url https://pypi.nvidia.com
+#
+# System dependencies (install before pip packages):
+#   sudo apt-get install -y libopenmpi-dev openmpi-bin
+
+# Core NVIDIA packages for FP4 Tensor Core acceleration
+tensorrt-llm>=1.1.0
+tensorrt>=10.13.0
+
+# PyTorch with CUDA support
+torch>=2.9.0
+
+# Transformers and model utilities
+transformers>=4.56.0
+accelerate>=1.7.0
+safetensors>=0.4.3
+
+# Vision model utilities
+qwen-vl-utils>=0.0.14
+opencv-python-headless>=4.8.0
+
+# Additional dependencies
+numpy<2
+huggingface-hub>=0.23.0
+pydantic>=2.9.0
