@@ -1,28 +1,82 @@
 # Requirements for FP4 Quantization and Inference on RTX 5090 (Blackwell)
 # 
+# This file contains all dependencies for running NVFP4 quantization with
+# true FP4 compute on NVIDIA Blackwell GPUs (RTX 5090, SM 10.0+)
+#
 # Install with:
 #   pip install -r requirements_fp4.txt --extra-index-url https://pypi.nvidia.com
 #
-# System dependencies (install before pip packages):
-#   sudo apt-get install -y libopenmpi-dev openmpi-bin
+# Or use the setup script:
+#   bash setup_fp4_env.sh
+#
+# System dependencies (installed by setup script):
+#   - libopenmpi-dev openmpi-bin (MPI support)
 
-# Core NVIDIA packages for FP4 Tensor Core acceleration
+# =============================================================================
+# Core NVIDIA Packages for FP4 Tensor Core Acceleration
+# =============================================================================
+
+# TensorRT-LLM for optimized LLM inference with FP4 GEMM kernels
 tensorrt-llm>=1.1.0
+
+# TensorRT runtime (usually installed as dependency of tensorrt-llm)
 tensorrt>=10.13.0
 
-# PyTorch with CUDA support
+# NVIDIA ModelOpt for FP4 quantization with AWQ-Lite calibration
+# Note: This is installed as nvidia-modelopt but imports as 'modelopt'
+nvidia-modelopt>=0.37.0
+
+# CUDA 13 cuBLAS libraries (required for TensorRT-LLM bindings)
+# Install from NVIDIA PyPI: pip install nvidia-cublas>=13.0.0 --extra-index-url https://pypi.nvidia.com
+nvidia-cublas>=13.0.0
+
+# =============================================================================
+# PyTorch with CUDA Support
+# =============================================================================
+
 torch>=2.9.0
 
-# Transformers and model utilities
+# =============================================================================
+# Transformers and Model Utilities
+# =============================================================================
+
+# HuggingFace Transformers for model loading
 transformers>=4.56.0
+
+# Accelerate for distributed inference and memory optimization
 accelerate>=1.7.0
+
+# Safe tensor serialization
 safetensors>=0.4.3
 
-# Vision model utilities
+# HuggingFace Hub for model downloads
+huggingface-hub>=0.23.0
+
+# =============================================================================
+# Vision-Language Model (VLM) Utilities
+# =============================================================================
+
+# Qwen-VL utilities for processing images/videos
 qwen-vl-utils>=0.0.14
+
+# OpenCV for image/video processing (headless version for servers)
 opencv-python-headless>=4.8.0
 
-# Additional dependencies
+# AV for video decoding
+av>=10.0.0
+
+# =============================================================================
+# Additional Dependencies
+# =============================================================================
+
+# NumPy (version <2 required for compatibility)
 numpy<2
-huggingface-hub>=0.23.0
+
+# Pydantic for configuration validation
 pydantic>=2.9.0
+
+# Rich for progress bars and formatted output
+rich>=13.0.0
+
+# Pillow for image processing
+pillow>=10.0.0
