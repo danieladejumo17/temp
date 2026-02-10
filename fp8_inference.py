@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
 import time
 import warnings
 from pathlib import Path
@@ -147,12 +148,14 @@ def analyze_video(model, processor, video_path: Path, prefetched_data, max_token
 # 7. Main — Sequential Video Processing
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="Fast Fault Monitor — Sequential (No Prefetch)")
+    parser = argparse.ArgumentParser(description="INT8 Inference with bitsandbytes")
     parser.add_argument("--video_dir", type=str, required=True)
     parser.add_argument("--model", type=str, default="nvidia/Cosmos-Reason1-7B")
     parser.add_argument("--fps", type=int, default=4)
     parser.add_argument("--max_tokens", type=int, default=7)
     parser.add_argument("--target_resolution", type=str, default="250x250")
+    parser.add_argument("--output_json", type=str, default=None,
+                        help="Path to save JSON results (default: <video_dir>/fp8_results.json)")
     args = parser.parse_args()
 
     width, height = map(int, args.target_resolution.split('x'))
@@ -164,36 +167,116 @@ def main():
         print("No video files found.")
         return
 
+    # Determine output JSON path
+    if args.output_json:
+        output_json_path = Path(args.output_json)
+    else:
+        output_json_path = video_dir / "fp8_results.json"
+
     model, processor = load_model(args.model)
     warmup_model(model, processor)
     base_text = build_cached_prompt(processor)
 
-    print(f"📂 Found {len(video_files)} videos — running SEQUENTIAL inference (no prefetch)\n" + "=" * 50)
+    # Get GPU info
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "Unknown"
+    compute_cap = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
 
-    total_start_time = time.time()
+    print(f"📂 Found {len(video_files)} videos — running INT8 inference (bitsandbytes)\n" + "=" * 50)
 
-    for video_path in video_files:
+    # Track results
+    results = []
+    total_load_time = 0.0
+    total_inference_time = 0.0
+    counts = {"Anomaly": 0, "Normal": 0, "Unknown": 0, "Error": 0}
+
+    batch_start_time = time.time()
+
+    for i, video_path in enumerate(video_files, 1):
         load_start = time.time()
-        prefetched_data = load_video(video_path, args.fps, target_resolution)
-        load_time = time.time() - load_start
-
-        analysis_start = time.time()
         try:
+            prefetched_data = load_video(video_path, args.fps, target_resolution)
+            load_time = time.time() - load_start
+            total_load_time += load_time
+
+            analysis_start = time.time()
             raw = analyze_video(model, processor, video_path, prefetched_data, args.max_tokens, base_text)
             result = parse_result(raw)
-            analysis_time = time.time() - analysis_start
-            total_time = time.time() - total_start_time
+            inference_time = time.time() - analysis_start
+            total_inference_time += inference_time
+
+            counts[result] += 1
+
+            results.append({
+                "file": video_path.name,
+                "result": result,
+                "raw_output": raw,
+                "load_time_s": round(load_time, 3),
+                "inference_time_s": round(inference_time, 3),
+            })
 
             print(
-                f"[{video_path.name}] -> {result} | Total: {total_time:.2f}s "
-                f"(Load: {load_time:.2f}s, GPU: {analysis_time:.2f}s)"
+                f"[{i}/{len(video_files)}] {video_path.name}: {result} "
+                f"(Load: {load_time:.2f}s, INT8 Inference: {inference_time:.2f}s)"
             )
-            total_start_time = time.time()
 
         except Exception as e:
-            print(f"[{video_path.name}] ERROR: {e}")
+            counts["Error"] += 1
+            results.append({
+                "file": video_path.name,
+                "result": "Error",
+                "raw_output": str(e),
+                "load_time_s": 0.0,
+                "inference_time_s": 0.0,
+            })
+            print(f"[{i}/{len(video_files)}] {video_path.name}: ERROR - {e}")
 
-    print("=" * 50 + "\n✅ Sequential batch processing complete.")
+    total_time = time.time() - batch_start_time
+
+    # Build output JSON
+    output_data = {
+        "config": {
+            "model": args.model,
+            "inference_mode": "bitsandbytes INT8",
+            "fps": args.fps,
+            "max_tokens": args.max_tokens,
+            "target_resolution": args.target_resolution,
+            "quantization": "INT8 (bitsandbytes load_in_8bit)",
+            "compute_type": "INT8 matrix multiplication",
+            "gpu": gpu_name,
+            "compute_capability": f"{compute_cap[0]}.{compute_cap[1]}",
+        },
+        "summary": {
+            "total_videos": len(video_files),
+            "anomalies": counts["Anomaly"],
+            "normals": counts["Normal"],
+            "unknowns": counts["Unknown"],
+            "errors": counts["Error"],
+            "total_load_time_s": round(total_load_time, 3),
+            "total_inference_time_s": round(total_inference_time, 3),
+            "total_time_s": round(total_time, 3),
+            "avg_inference_time_s": round(total_inference_time / len(video_files), 3) if video_files else 0,
+        },
+        "results": results,
+    }
+
+    # Save JSON
+    with open(output_json_path, "w") as f:
+        json.dump(output_data, f, indent=2)
+
+    # Print summary
+    print("=" * 50)
+    print("\nSUMMARY — INT8 Inference (bitsandbytes)")
+    print("=" * 50)
+    print(f"Total videos: {len(video_files)}")
+    print(f"  - Anomaly: {counts['Anomaly']}")
+    print(f"  - Normal: {counts['Normal']}")
+    print(f"  - Unknown: {counts['Unknown']}")
+    print(f"  - Errors: {counts['Error']}")
+    print(f"\nTotal load time: {total_load_time:.2f}s")
+    print(f"Total INT8 inference time: {total_inference_time:.2f}s")
+    print(f"Average INT8 inference time: {total_inference_time / len(video_files):.2f}s per video")
+    print(f"\nResults saved to: {output_json_path}")
+    print("✅ INT8 inference complete.")
 
 
 if __name__ == "__main__":

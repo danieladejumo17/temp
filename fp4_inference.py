@@ -520,7 +520,8 @@ def load_video(video_path: Path, target_fps: int, target_resolution: tuple[int, 
             cap.release()
 
     image_inputs, video_inputs = qwen_vl_utils.process_vision_info(
-        [{"role": "user", "content": [{"type": "video", "video": str(video_path), "total_pixels": total_pixels}]}]
+        [{"role": "user", "content": [{"type": "video", "video": str(video_path), "total_pixels": total_pixels}]}] # TODO fix total pixels to const
+        # [{"role": "user", "content": [{"type": "video", "video": str(video_path), "fps": 4, "total_pixels": 4096 * 30**2}]}] # TODO fix total pixels to const
     )
     return image_inputs, video_inputs
 
