@@ -60,12 +60,20 @@ def convert_hf_to_trtllm_checkpoint(
     output_dir: Path,
     tp_size: int = 1,
     pp_size: int = 1,
+    calibration_video_dir: str = None,
 ):
     """
     Convert HuggingFace model to TensorRT-LLM checkpoint format with FP4 quantization.
     
     This step calibrates and quantizes the model weights to NVIDIA's native FP4 format
     (NVFP4 - NVIDIA's 4-bit floating point format optimized for Blackwell Tensor Cores).
+    
+    Args:
+        model_name: HuggingFace model name
+        output_dir: Output directory
+        tp_size: Tensor parallelism size
+        pp_size: Pipeline parallelism size
+        calibration_video_dir: Directory containing videos for calibration
     """
     checkpoint_dir = output_dir / "trtllm_checkpoint"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -101,18 +109,24 @@ def convert_hf_to_trtllm_checkpoint(
         if hasattr(e, 'stderr'):
             print(f"Subprocess failed: {e.stderr}")
         print("Using TensorRT-LLM Python API for conversion...")
-        convert_with_python_api(model_name, checkpoint_dir, tp_size)
+        convert_with_python_api(model_name, checkpoint_dir, tp_size, calibration_video_dir)
     
     return checkpoint_dir
 
 
-def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int = 1):
+def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int = 1, calibration_video_dir: str = None):
     """
     Convert VLM model using NVIDIA ModelOpt for FP4 quantization with calibration.
     
     For Vision-Language Models like Cosmos-Reason1-7B (based on Qwen2.5-VL),
     we use NVIDIA's Model Optimization toolkit with proper calibration for
     true FP4 compute on Blackwell Tensor Cores.
+    
+    Args:
+        model_name: HuggingFace model name
+        checkpoint_dir: Output directory for checkpoint
+        tp_size: Tensor parallelism size
+        calibration_video_dir: Directory containing videos for calibration (optional)
     """
     try:
         import torch
@@ -158,13 +172,170 @@ def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int 
     print("  - Weight quantizer: FP4 with block size 16")
     print("  - Input quantizer: FP4 with dynamic scaling")
     
-    # Create calibration forward loop
-    # For proper FP4 calibration, we need to run sample data through the model
-    def create_calibration_forward_loop(model, processor, num_samples=8):
-        """Create a forward loop for calibration with sample text inputs."""
+    # Create calibration forward loop with video support
+    def create_calibration_forward_loop_with_videos(model, processor, video_dir: str, num_samples=8):
+        """Create a forward loop for calibration with video inputs.
         
-        # Sample prompts for calibration (diverse examples)
+        This calibrates both the vision encoder and language model components
+        by processing actual video data through the model.
+        """
+        import cv2
+        try:
+            import qwen_vl_utils
+        except ImportError:
+            print("  Warning: qwen_vl_utils not available, using basic video loading")
+            qwen_vl_utils = None
+        
+        video_dir = Path(video_dir)
+        video_files = sorted(list(video_dir.glob("*.mp4")))[:num_samples]
+        
+        if not video_files:
+            print(f"  Warning: No videos found in {video_dir}")
+            return None
+        
+        print(f"  Found {len(video_files)} videos for calibration")
+        
+        # Calibration prompts to pair with videos
+        # Calibration prompts including the autonomous driving safety analysis prompt
         calibration_prompts = [
+            # Autonomous driving safety prompt (from fp8_inference.py)
+            (
+                "You are an autonomous driving safety expert analyzing this video for EXTERNAL ANOMALIES that may impact safe AV operation.\n\n"
+                "<think>\n"
+                "- Obstacles, pedestrians, or vehicles violating rules\n"
+                "- Roadwork, blocked lanes, poor visibility, or hazards\n"
+                "- Reflections, shadows, or false visual cues confusing perception\n"
+                "</think>\n\n"
+                "<answer>\n"
+                "Is there any external anomaly in this video? Reply with exactly one word of the following:\n"
+                "Classification: Anomaly — if any obstacle, obstruction, or unsafe condition is visible.\n"
+                "Classification: Normal — if no anomaly or obstruction is visible.\n"
+                "</answer>"
+            ),
+            # General video understanding prompts
+            "Describe what you see in this video.",
+            "What is happening in this scene?",
+            "Analyze the video content and explain.",
+            "Identify any objects or activities visible.",
+            "Is there anything unusual in this video?",
+            "Summarize the visual content.",
+            "What actions are being performed?",
+            "Describe the environment shown.",
+        ]
+        
+        def load_video_for_calibration(video_path, target_fps=4, target_resolution=(250, 250)):
+            """Load video and prepare for model input."""
+            if qwen_vl_utils:
+                try:
+                    cap = cv2.VideoCapture(str(video_path))
+                    if not cap.isOpened():
+                        return None, None
+                    
+                    native_fps = cap.get(cv2.CAP_PROP_FPS)
+                    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    cap.release()
+                    
+                    effective_fps = min(target_fps, native_fps) if native_fps > 0 else target_fps
+                    duration_seconds = frame_count / native_fps if native_fps > 0 else 0
+                    num_frames = max(1, int(duration_seconds * effective_fps))
+                    total_pixels = num_frames * target_resolution[0] * target_resolution[1]
+                    
+                    image_inputs, video_inputs = qwen_vl_utils.process_vision_info(
+                        [{"role": "user", "content": [{"type": "video", "video": str(video_path), "total_pixels": total_pixels}]}]
+                    )
+                    return image_inputs, video_inputs
+                except Exception as e:
+                    print(f"    Video load error: {e}")
+                    return None, None
+            return None, None
+        
+        def forward_loop(model):
+            """Run calibration samples through the model with video inputs."""
+            model.eval()
+            device = next(model.parameters()).device
+            
+            successful_samples = 0
+            
+            with torch.no_grad():
+                for i, video_path in enumerate(video_files):
+                    try:
+                        prompt = calibration_prompts[i % len(calibration_prompts)]
+                        
+                        # Load video
+                        image_inputs, video_inputs = load_video_for_calibration(video_path)
+                        
+                        if video_inputs is None:
+                            print(f"    Skipping {video_path.name}: could not load")
+                            continue
+                        
+                        # Build conversation with video
+                        content = [
+                            {"type": "video", "video": str(video_path)},
+                            {"type": "text", "text": prompt},
+                        ]
+                        conversation = [{"role": "user", "content": content}]
+                        
+                        # Apply chat template
+                        text = processor.apply_chat_template(
+                            conversation,
+                            tokenize=False,
+                            add_generation_prompt=True
+                        )
+                        
+                        # Process inputs
+                        inputs = processor(
+                            text=[text],
+                            images=image_inputs,
+                            videos=video_inputs,
+                            padding=True,
+                            return_tensors="pt",
+                        )
+                        
+                        # Move to device
+                        inputs = {k: v.to(device) if hasattr(v, 'to') else v 
+                                  for k, v in inputs.items()}
+                        
+                        # Convert pixel values to float16
+                        if 'pixel_values' in inputs and inputs['pixel_values'] is not None:
+                            inputs['pixel_values'] = inputs['pixel_values'].to(torch.float16)
+                        if 'pixel_values_videos' in inputs and inputs['pixel_values_videos'] is not None:
+                            inputs['pixel_values_videos'] = inputs['pixel_values_videos'].to(torch.float16)
+                        
+                        # Forward pass for calibration
+                        _ = model(**inputs)
+                        
+                        successful_samples += 1
+                        print(f"    [{successful_samples}/{num_samples}] Calibrated with: {video_path.name}")
+                        
+                    except Exception as e:
+                        print(f"    Calibration sample {video_path.name} skipped: {str(e)[:60]}...")
+                        continue
+            
+            print(f"  Video calibration completed with {successful_samples} samples")
+        
+        return forward_loop
+    
+    # Create text-only calibration forward loop as fallback
+    def create_calibration_forward_loop_text_only(model, processor, num_samples=8):
+        """Create a forward loop for calibration with text-only inputs (fallback)."""
+        
+        # Calibration prompts including the autonomous driving safety analysis prompt
+        calibration_prompts = [
+            # Autonomous driving safety prompt (from fp8_inference.py)
+            (
+                "You are an autonomous driving safety expert analyzing this video for EXTERNAL ANOMALIES that may impact safe AV operation.\n\n"
+                "<think>\n"
+                "- Obstacles, pedestrians, or vehicles violating rules\n"
+                "- Roadwork, blocked lanes, poor visibility, or hazards\n"
+                "- Reflections, shadows, or false visual cues confusing perception\n"
+                "</think>\n\n"
+                "<answer>\n"
+                "Is there any external anomaly in this video? Reply with exactly one word of the following:\n"
+                "Classification: Anomaly — if any obstacle, obstruction, or unsafe condition is visible.\n"
+                "Classification: Normal — if no anomaly or obstruction is visible.\n"
+                "</answer>"
+            ),
+            # General prompts
             "Describe what you see in this image.",
             "What is happening in this video?",
             "Analyze the contents and explain.",
@@ -183,8 +354,6 @@ def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int 
             with torch.no_grad():
                 for i, prompt in enumerate(calibration_prompts[:num_samples]):
                     try:
-                        # Create dummy inputs for the language model part
-                        # For VLM, we calibrate the text processing path
                         inputs = processor(
                             text=prompt,
                             return_tensors="pt",
@@ -193,20 +362,10 @@ def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int 
                             max_length=512,
                         )
                         
-                        # Move to device
                         inputs = {k: v.to(device) if hasattr(v, 'to') else v 
                                   for k, v in inputs.items()}
                         
-                        # Forward pass for calibration
-                        # Use only the inputs that the model accepts
                         model_inputs = {}
-                        if hasattr(model, 'forward'):
-                            import inspect
-                            sig = inspect.signature(model.forward)
-                            valid_keys = set(sig.parameters.keys())
-                            model_inputs = {k: v for k, v in inputs.items() 
-                                           if k in valid_keys or k in ['input_ids', 'attention_mask']}
-                        
                         if 'input_ids' in inputs:
                             model_inputs['input_ids'] = inputs['input_ids']
                         if 'attention_mask' in inputs:
@@ -216,22 +375,33 @@ def convert_with_python_api(model_name: str, checkpoint_dir: Path, tp_size: int 
                             _ = model(**model_inputs)
                         
                         if (i + 1) % 2 == 0:
-                            print(f"  Calibration progress: {i + 1}/{num_samples} samples")
+                            print(f"  Text calibration progress: {i + 1}/{num_samples} samples")
                             
                     except Exception as e:
                         print(f"  Calibration sample {i+1} skipped: {str(e)[:50]}...")
                         continue
             
-            print(f"  Calibration completed with {num_samples} samples")
+            print(f"  Text-only calibration completed with {num_samples} samples")
         
         return forward_loop
     
     # Apply quantization with calibration
     print("\nRunning FP4 calibration (this calibrates quantization scales)...")
+    
+    # Try video calibration first if directory provided
+    forward_loop = None
+    if calibration_video_dir and Path(calibration_video_dir).exists():
+        print(f"  Using video calibration from: {calibration_video_dir}")
+        forward_loop = create_calibration_forward_loop_with_videos(
+            model, processor, calibration_video_dir, num_samples=8
+        )
+    
+    # Fall back to text-only if no videos
+    if forward_loop is None:
+        print("  Using text-only calibration (no video directory provided)")
+        forward_loop = create_calibration_forward_loop_text_only(model, processor, num_samples=8)
+    
     try:
-        # Create the calibration forward loop
-        forward_loop = create_calibration_forward_loop(model, processor, num_samples=8)
-        
         # Apply quantization with calibration
         mtq.quantize(model, quant_config, forward_loop=forward_loop)
         print("\nFP4 quantization with calibration applied successfully!")
@@ -474,12 +644,21 @@ def quantize_model(
     tp_size: int = 1,
     max_batch_size: int = 1,
     verify: bool = True,
+    calibration_video_dir: str = None,
 ):
     """
     Main quantization function: converts HuggingFace model to TensorRT-LLM FP4 engine.
     
     This creates an engine that uses TRUE hardware FP4 computation on RTX 5090's
     Blackwell Tensor Cores - not emulated FP4 via higher precision arithmetic.
+    
+    Args:
+        model_name: HuggingFace model name
+        output_dir: Output directory for the quantized model
+        tp_size: Tensor parallelism size
+        max_batch_size: Maximum batch size
+        verify: Whether to verify after quantization
+        calibration_video_dir: Directory containing videos for calibration
     """
     print("=" * 70)
     print("FP4 Quantization with Native Blackwell Tensor Core Acceleration")
@@ -488,6 +667,8 @@ def quantize_model(
     print(f"Output: {output_dir}")
     print(f"Tensor Parallelism: {tp_size}")
     print(f"Quantization: NVFP4 (Native Blackwell FP4)")
+    if calibration_video_dir:
+        print(f"Calibration videos: {calibration_video_dir}")
     
     # Check GPU
     gpu_name, compute_cap, gpu_memory = check_gpu_compatibility()
@@ -499,7 +680,7 @@ def quantize_model(
     
     # Step 1: Convert to TensorRT-LLM checkpoint with FP4 quantization
     checkpoint_dir = convert_hf_to_trtllm_checkpoint(
-        model_name, output_path, tp_size
+        model_name, output_path, tp_size, calibration_video_dir=calibration_video_dir
     )
     
     # Step 2: Build TensorRT engine with FP4 Tensor Core kernels
@@ -521,6 +702,8 @@ def quantize_model(
         "engine_dir": str(engine_dir),
         "vision_dir": str(vision_dir),
         "checkpoint_dir": str(checkpoint_dir),
+        "calibration_video_dir": calibration_video_dir,
+        "calibration_type": "video" if calibration_video_dir else "text-only",
         "quantization_time_seconds": time.time() - start_time,
         "gpu_used": gpu_name,
         "gpu_compute_capability": f"{compute_cap[0]}.{compute_cap[1]}",
@@ -560,8 +743,11 @@ Unlike bitsandbytes FP4 which stores weights in 4-bit but computes in FP16/BF16,
 this engine performs actual FP4 matrix multiplications in hardware.
 
 Examples:
-  # Basic quantization
+  # Basic quantization (text-only calibration)
   python fp4_quantization.py --output_dir ./cosmos-fp4-engine
+
+  # With video calibration for better VLM accuracy
+  python fp4_quantization.py --output_dir ./cosmos-fp4-engine --calibration_video_dir ./videos
 
   # With tensor parallelism for multi-GPU
   python fp4_quantization.py --output_dir ./cosmos-fp4-engine --tp_size 2
@@ -584,6 +770,12 @@ Requirements:
         type=str,
         required=True,
         help="Directory to save the FP4 TensorRT engine"
+    )
+    parser.add_argument(
+        "--calibration_video_dir",
+        type=str,
+        default=None,
+        help="Directory containing videos for calibration (improves VLM accuracy)"
     )
     parser.add_argument(
         "--tp_size",
@@ -611,6 +803,7 @@ Requirements:
         tp_size=args.tp_size,
         max_batch_size=args.max_batch_size,
         verify=not args.no_verify,
+        calibration_video_dir=args.calibration_video_dir,
     )
 
 
